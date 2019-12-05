@@ -17,6 +17,7 @@
 
 #include <iostream>
 #include "assert.h"
+#include "math.h"
 
 #include "optionparser.h"
 #include "smt-switch/boolector_factory.h"
@@ -48,7 +49,9 @@ enum optionIndex
   ENGINE,
   BOUND,
   PROP,
-  VERBOSITY
+  VERBOSITY,
+  RESET,
+  RESET_BND
 };
 
 struct Arg : public option::Arg
@@ -117,6 +120,18 @@ const option::Descriptor usage[] = {
     "verbosity",
     Arg::Numeric,
     "  --verbosity, -v \tVerbosity for printing to standard out." },
+  { RESET,
+    0,
+    "r",
+    "reset",
+    Arg::NonEmpty,
+    " --reset, -r <reset input> \tInput to use for reset signal (prefix with ~ for negative reset)"},
+  { RESET_BND,
+    0,
+    "s",
+    "resetsteps",
+    Arg::Numeric,
+    " --resetsteps, -s <integer> \tNumber of steps to apply reset for (default: 1)"},
   { 0, 0, 0, 0, 0, 0 }
 };
 /*********************************** end Option Handling setup
@@ -159,6 +174,8 @@ int main(int argc, char ** argv)
   unsigned int prop_idx = default_prop_idx;
   unsigned int bound = default_bound;
   unsigned int verbosity = default_verbosity;
+  std::string reset_name = default_reset_name;
+  unsigned int reset_bnd = default_reset_bnd;
 
   for (int i = 0; i < parse.optionsCount(); ++i) {
     option::Option & opt = buffer[i];
@@ -169,6 +186,8 @@ int main(int argc, char ** argv)
       case BOUND: bound = atoi(opt.arg); break;
       case PROP: prop_idx = atoi(opt.arg); break;
       case VERBOSITY: verbosity = atoi(opt.arg); break;
+      case RESET: reset_name = opt.arg; break;
+      case RESET_BND: reset_bnd = atoi(opt.arg); break;
       case UNKNOWN_OPTION:
         // not possible because Arg::Unknown returns ARG_ILLEGAL
         // which aborts the parse with an error
@@ -215,7 +234,66 @@ int main(int argc, char ** argv)
     }
 
     Term bad = btor_enc.badvec()[prop_idx];
-    Property p(rts, s->make_term(PrimOp::Not, bad));
+    Term prop_term = s->make_term(Not, bad);
+
+    // add reset logic if requested
+    if (!reset_name.empty())
+    {
+      bool negative_reset = false;
+
+      if (reset_name.at(0) == '~')
+      {
+        reset_name = reset_name.substr(1, reset_name.length()-1);
+        negative_reset = true;
+      }
+
+      Term reset_symbol;
+      bool found_reset_symbol = false;
+      for (auto i : rts.inputs())
+      {
+        if (i->to_string() == reset_name)
+        {
+          reset_symbol = i;
+          found_reset_symbol = true;
+          break;
+        }
+      }
+
+      if (!found_reset_symbol)
+      {
+        logger.log(0, "Could not find reset symbol: {}", reset_name);
+        return 3;
+      }
+
+      if (reset_symbol->get_sort()->get_sort_kind() != BV ||
+          reset_symbol->get_sort()->get_width() != 1)
+      {
+        logger.log(0, "Unexpected reset symbol sort: {}", reset_symbol->get_sort());
+        return 3;
+      }
+
+      Sort one_bit_sort = s->make_sort(BV, 1);
+      uint32_t num_bits = ceil(log2(reset_bnd))+1;
+      Sort bvsort = s->make_sort(BV, num_bits);
+      Term reset_bnd_term = s->make_term(reset_bnd, bvsort);
+      Term reset_counter = rts.make_state("__internal_cosa2_reset_cnt__", bvsort);
+
+      Term in_reset = s->make_term(BVUlt, reset_counter, reset_bnd_term);
+      Term reset_done = s->make_term(Not, in_reset);
+
+      rts.constrain_init(s->make_term(Equal, reset_counter, s->make_term(0, bvsort)));
+      rts.set_next(reset_counter, s->make_term(BVAdd, reset_counter, s->make_term(1, bvsort)));
+
+      Term active_reset = negative_reset ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
+        : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
+      Term inactive_reset = s->make_term(Not, active_reset);
+      rts.add_invar(s->make_term(Implies, in_reset, active_reset));
+      rts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
+
+      prop_term = s->make_term(Implies, reset_done, prop_term);
+    }
+
+    Property p(rts, prop_term);
     logger.log(1, "Solving property: {}", p.prop());
 
     std::shared_ptr<Prover> prover;

@@ -52,6 +52,8 @@ static const Engine default_engine = BMC;
 static const unsigned int default_prop_idx = 0;
 static const unsigned int default_bound = 10;
 static const unsigned int default_verbosity = 0;
+static const std::string default_reset_name = "";
+static const unsigned int default_reset_bnd = 1;
 /********************************* End Default Values
  * ********************************/
 }  // namespace cosa
