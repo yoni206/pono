@@ -51,7 +51,8 @@ enum optionIndex
   PROP,
   VERBOSITY,
   RESET,
-  RESET_BND
+  RESET_BND,
+  CLK
 };
 
 struct Arg : public option::Arg
@@ -132,6 +133,12 @@ const option::Descriptor usage[] = {
     "resetsteps",
     Arg::Numeric,
     " --resetsteps, -s <integer> \tNumber of steps to apply reset for (default: 1)"},
+  { CLK,
+    0,
+    "c",
+    "clock",
+    Arg::NonEmpty,
+    " --clock, -c <clock name> \tInput to use for clock signal (only supports starting at 0 and toggling each step)"},
   { 0, 0, 0, 0, 0, 0 }
 };
 /*********************************** end Option Handling setup
@@ -176,6 +183,7 @@ int main(int argc, char ** argv)
   unsigned int verbosity = default_verbosity;
   std::string reset_name = default_reset_name;
   unsigned int reset_bnd = default_reset_bnd;
+  std::string clock_name = default_clock_name;
 
   for (int i = 0; i < parse.optionsCount(); ++i) {
     option::Option & opt = buffer[i];
@@ -188,6 +196,7 @@ int main(int argc, char ** argv)
       case VERBOSITY: verbosity = atoi(opt.arg); break;
       case RESET: reset_name = opt.arg; break;
       case RESET_BND: reset_bnd = atoi(opt.arg); break;
+      case CLK: clock_name = opt.arg; break;
       case UNKNOWN_OPTION:
         // not possible because Arg::Unknown returns ARG_ILLEGAL
         // which aborts the parse with an error
@@ -291,6 +300,39 @@ int main(int argc, char ** argv)
       rts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
 
       prop_term = s->make_term(Implies, reset_done, prop_term);
+    }
+
+    // toggle clock if requested (only supporting toggling every step and starting at 0 for now)
+    if (!clock_name.empty())
+    {
+      Term clock_symbol;
+      bool found_clock_symbol = false;
+      for (auto i : rts.inputs())
+      {
+        if (i->to_string() == clock_name)
+        {
+          clock_symbol = i;
+          found_clock_symbol = true;
+          break;
+        }
+      }
+
+      if (!found_clock_symbol)
+      {
+        logger.log(0, "Could not find clock symbol: {}", clock_name);
+        return 3;
+      }
+
+      Sort one_bit_sort = s->make_sort(BV, 1);
+
+      if (clock_symbol->get_sort() != one_bit_sort)
+      {
+        throw CosaException("Expecting a one-bit clock sort.");
+      }
+
+      Term zero = s->make_term(0, one_bit_sort);
+      rts.constrain_init(s->make_term(Equal, clock_symbol, zero));
+      rts.constrain_trans(s->make_term(Equal, rts.next(clock_symbol), s->make_term(BVNot, clock_symbol)));
     }
 
     Property p(rts, prop_term);

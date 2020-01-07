@@ -117,7 +117,7 @@ bool RelationalTransitionSystem::known_symbols(const Term & term) const
     }
 
     if (t->is_symbolic_const()
-        && !((inputs_.find(t) != inputs_.end())
+        && !((inputs_.find(curr(t)) != inputs_.end())
              || (states_.find(t) != states_.end())
              || (next_states_.find(t) != next_states_.end()))) {
       return false;
