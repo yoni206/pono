@@ -291,7 +291,10 @@ int main(int argc, char ** argv)
       Term reset_done = s->make_term(Not, in_reset);
 
       rts.constrain_init(s->make_term(Equal, reset_counter, s->make_term(0, bvsort)));
-      rts.set_next(reset_counter, s->make_term(BVAdd, reset_counter, s->make_term(1, bvsort)));
+      rts.set_next(reset_counter, s->make_term(Ite,
+                                               reset_done,
+                                               reset_counter,
+                                               s->make_term(BVAdd, reset_counter, s->make_term(1, bvsort))));
 
       Term active_reset = negative_reset ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
         : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
