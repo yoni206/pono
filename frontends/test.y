@@ -1,8 +1,21 @@
 %{
+
+
     #include<cstdio>
     #include<iostream>
     #include<string>
-    #include "simple_encoder.h"
+    #include <map>
+    #include <string>
+    #include <unordered_map>
+
+    #include "assert.h"
+    #include "exceptions.h"
+    #include "rts.h"
+    #include "smt-switch/smt.h"
+
+      smt::Sort sort_;
+      std::string symbol_;
+    //#include "encoder.h"
     using namespace std;
     extern int yylex();
     extern int yypasrse();

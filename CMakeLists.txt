@@ -23,7 +23,7 @@ link_directories("/usr/local/lib")
 # find package
 #list(APPEND CMAKE_PREFIX_PATH "${PROJECT_SOURCE_DIR}/smt-switch")
 
-add_executable(cosa2
+add_library(cosa2
   "${PROJECT_SOURCE_DIR}/cosa2.cpp"
   "${PROJECT_SOURCE_DIR}/frontends/btor2_encoder.cpp"
   "${PROJECT_SOURCE_DIR}/core/rts.cpp"
