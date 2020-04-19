@@ -190,9 +190,10 @@ ProverResult check_prop(Engine engine,
 }
 
 smt::Term add_reset_and_clock(std::string reset_name,
+                              unsigned int reset_bnd,
                               std::string clock_name,
                               smt::Term prop_term,
-                              smt::TransitionSystem & ts,
+                              TransitionSystem & ts,
                               smt::SmtSolver & s)
 {
   // add reset logic if requested
@@ -206,7 +207,7 @@ smt::Term add_reset_and_clock(std::string reset_name,
 
     Term reset_symbol;
     bool found_reset_symbol = false;
-    for (auto i : rts.inputs()) {
+    for (auto i : ts.inputs()) {
       if (i->to_string() == reset_name) {
         reset_symbol = i;
         found_reset_symbol = true;
@@ -215,29 +216,27 @@ smt::Term add_reset_and_clock(std::string reset_name,
     }
 
     if (!found_reset_symbol) {
-      logger.log(0, "Could not find reset symbol: {}", reset_name);
-      return 3;
+      throw CosaException("Could not find reset symbol: " + reset_name);
     }
 
     if (reset_symbol->get_sort()->get_sort_kind() != BV
         || reset_symbol->get_sort()->get_width() != 1) {
-      logger.log(
-          0, "Unexpected reset symbol sort: {}", reset_symbol->get_sort());
-      return 3;
+      throw CosaException("Unexpected reset symbol sort: "
+                          + reset_symbol->get_sort()->to_string());
     }
 
     Sort one_bit_sort = s->make_sort(BV, 1);
     uint32_t num_bits = ceil(log2(reset_bnd)) + 1;
     Sort bvsort = s->make_sort(BV, num_bits);
     Term reset_bnd_term = s->make_term(reset_bnd, bvsort);
-    Term reset_counter = rts.make_state("__internal_cosa2_reset_cnt__", bvsort);
+    Term reset_counter = ts.make_state("__internal_cosa2_reset_cnt__", bvsort);
 
     Term in_reset = s->make_term(BVUlt, reset_counter, reset_bnd_term);
     Term reset_done = s->make_term(Not, in_reset);
 
-    rts.constrain_init(
+    ts.constrain_init(
         s->make_term(Equal, reset_counter, s->make_term(0, bvsort)));
-    rts.set_next(
+    ts.assign_next(
         reset_counter,
         s->make_term(
             Ite,
@@ -250,8 +249,8 @@ smt::Term add_reset_and_clock(std::string reset_name,
             ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
             : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
     Term inactive_reset = s->make_term(Not, active_reset);
-    rts.add_invar(s->make_term(Implies, in_reset, active_reset));
-    rts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
+    ts.add_invar(s->make_term(Implies, in_reset, active_reset));
+    ts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
 
     prop_term = s->make_term(Implies, reset_done, prop_term);
   }
@@ -261,7 +260,7 @@ smt::Term add_reset_and_clock(std::string reset_name,
   if (!clock_name.empty()) {
     Term clock_symbol;
     bool found_clock_symbol = false;
-    for (auto i : rts.inputs()) {
+    for (auto i : ts.inputs()) {
       if (i->to_string() == clock_name) {
         clock_symbol = i;
         found_clock_symbol = true;
@@ -270,8 +269,7 @@ smt::Term add_reset_and_clock(std::string reset_name,
     }
 
     if (!found_clock_symbol) {
-      logger.log(0, "Could not find clock symbol: {}", clock_name);
-      return 3;
+      throw CosaException("Could not find clock symbol: " + clock_name);
     }
 
     Sort one_bit_sort = s->make_sort(BV, 1);
@@ -281,9 +279,8 @@ smt::Term add_reset_and_clock(std::string reset_name,
     }
 
     Term zero = s->make_term(0, one_bit_sort);
-    rts.constrain_init(s->make_term(Equal, clock_symbol, zero));
-    rts.constrain_trans(s->make_term(
-        Equal, rts.next(clock_symbol), s->make_term(BVNot, clock_symbol)));
+    ts.constrain_init(s->make_term(Equal, clock_symbol, zero));
+    ts.assign_next(clock_symbol, s->make_term(BVNot, clock_symbol));
   }
 
   return prop_term;
@@ -398,7 +395,8 @@ int main(int argc, char ** argv)
             + " (" + to_string(num_props) + ")");
       }
       Term prop = propvec[prop_idx];
-      prop = add_reset_and_clock(reset_name, clock_name, prop, fts, s);
+      prop =
+          add_reset_and_clock(reset_name, reset_bnd, clock_name, prop, fts, s);
       Property p(fts, prop);
       vector<UnorderedTermMap> cex;
 
@@ -439,7 +437,8 @@ int main(int argc, char ** argv)
             + " (" + to_string(num_props) + ")");
       }
       Term prop = propvec[prop_idx];
-      prop = add_reset_and_clock(reset_name, clock_name, prop, fts, s);
+      prop =
+          add_reset_and_clock(reset_name, reset_bnd, clock_name, prop, rts, s);
       Property p(rts, prop);
       std::vector<UnorderedTermMap> cex;
 
