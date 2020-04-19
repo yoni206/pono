@@ -1,5 +1,5 @@
 /*********************                                                        */
-/*! \file 
+/*! \file
  ** \verbatim
  ** Top contributors (to current version):
  **   Makai Mann, Ahmed Irfan
@@ -9,11 +9,10 @@
  ** All rights reserved.  See the file LICENSE in the top-level source
  ** directory for licensing information.\endverbatim
  **
- ** \brief 
+ ** \brief
  **
- ** 
+ **
  **/
-
 
 #include <iostream>
 #include "assert.h"
@@ -27,11 +26,14 @@
 
 #include "bmc.h"
 #include "bmc_simplepath.h"
+#include "core/fts.h"
 #include "defaults.h"
 #include "frontends/btor2_encoder.h"
+#include "frontends/smv_encoder.h"
 #include "interpolant.h"
 #include "kinduction.h"
 #include "printers/btor2_witness_printer.h"
+#include "printers/vcd_witness_printer.h"
 #include "prop.h"
 #include "utils/logger.h"
 
@@ -50,6 +52,7 @@ enum optionIndex
   BOUND,
   PROP,
   VERBOSITY,
+  VCDNAME,
   RESET,
   RESET_BND,
   CLK
@@ -108,7 +111,7 @@ const option::Descriptor usage[] = {
     "k",
     "bound",
     Arg::Numeric,
-    "  --bound, -k \tBound to check up until." },
+    "  --bound, -k \tBound to check up until (default: 10)." },
   { PROP,
     0,
     "p",
@@ -121,28 +124,170 @@ const option::Descriptor usage[] = {
     "verbosity",
     Arg::Numeric,
     "  --verbosity, -v \tVerbosity for printing to standard out." },
+  { VCDNAME,
+    0,
+    "",
+    "vcd",
+    Arg::NonEmpty,
+    "  --vcd \tName of Value Change Dump (VCD) if witness exists." },
   { RESET,
     0,
     "r",
     "reset",
     Arg::NonEmpty,
-    " --reset, -r <reset input> \tInput to use for reset signal (prefix with ~ for negative reset)"},
+    " --reset, -r <reset input> \tInput to use for reset signal (prefix with ~ "
+    "for negative reset)" },
   { RESET_BND,
     0,
     "s",
     "resetsteps",
     Arg::Numeric,
-    " --resetsteps, -s <integer> \tNumber of steps to apply reset for (default: 1)"},
+    " --resetsteps, -s <integer> \tNumber of steps to apply reset for "
+    "(default: 1)" },
   { CLK,
     0,
     "c",
     "clock",
     Arg::NonEmpty,
-    " --clock, -c <clock name> \tInput to use for clock signal (only supports starting at 0 and toggling each step)"},
+    " --clock, -c <clock name> \tInput to use for clock signal (only supports "
+    "starting at 0 and toggling each step)" },
   { 0, 0, 0, 0, 0, 0 }
 };
 /*********************************** end Option Handling setup
  * ***************************************/
+
+ProverResult check_prop(Engine engine,
+                        unsigned int bound,
+                        Property & p,
+                        SmtSolver & s,
+                        SmtSolver & second_solver,
+                        std::vector<UnorderedTermMap> & cex)
+{
+  logger.log(1, "Solving property: {}", p.prop());
+
+  logger.log(3, "INIT:\n{}", p.transition_system().init());
+  logger.log(3, "TRANS:\n{}", p.transition_system().trans());
+
+  std::shared_ptr<Prover> prover;
+  if (engine == BMC) {
+    prover = std::make_shared<Bmc>(p, s);
+  } else if (engine == BMC_SP) {
+    prover = std::make_shared<BmcSimplePath>(p, s);
+  } else if (engine == KIND) {
+    prover = std::make_shared<KInduction>(p, s);
+  } else if (engine == INTERP) {
+    assert(second_solver != NULL);
+    prover = std::make_shared<InterpolantMC>(p, s, second_solver);
+  } else {
+    throw CosaException("Unimplemented engine.");
+  }
+
+  ProverResult r = prover->check_until(bound);
+  if (r == FALSE) {
+    prover->witness(cex);
+  }
+  return r;
+}
+
+smt::Term add_reset_and_clock(std::string reset_name,
+                              std::string clock_name,
+                              smt::Term prop_term,
+                              smt::TransitionSystem & ts,
+                              smt::SmtSolver & s)
+{
+  // add reset logic if requested
+  if (!reset_name.empty()) {
+    bool negative_reset = false;
+
+    if (reset_name.at(0) == '~') {
+      reset_name = reset_name.substr(1, reset_name.length() - 1);
+      negative_reset = true;
+    }
+
+    Term reset_symbol;
+    bool found_reset_symbol = false;
+    for (auto i : rts.inputs()) {
+      if (i->to_string() == reset_name) {
+        reset_symbol = i;
+        found_reset_symbol = true;
+        break;
+      }
+    }
+
+    if (!found_reset_symbol) {
+      logger.log(0, "Could not find reset symbol: {}", reset_name);
+      return 3;
+    }
+
+    if (reset_symbol->get_sort()->get_sort_kind() != BV
+        || reset_symbol->get_sort()->get_width() != 1) {
+      logger.log(
+          0, "Unexpected reset symbol sort: {}", reset_symbol->get_sort());
+      return 3;
+    }
+
+    Sort one_bit_sort = s->make_sort(BV, 1);
+    uint32_t num_bits = ceil(log2(reset_bnd)) + 1;
+    Sort bvsort = s->make_sort(BV, num_bits);
+    Term reset_bnd_term = s->make_term(reset_bnd, bvsort);
+    Term reset_counter = rts.make_state("__internal_cosa2_reset_cnt__", bvsort);
+
+    Term in_reset = s->make_term(BVUlt, reset_counter, reset_bnd_term);
+    Term reset_done = s->make_term(Not, in_reset);
+
+    rts.constrain_init(
+        s->make_term(Equal, reset_counter, s->make_term(0, bvsort)));
+    rts.set_next(
+        reset_counter,
+        s->make_term(
+            Ite,
+            reset_done,
+            reset_counter,
+            s->make_term(BVAdd, reset_counter, s->make_term(1, bvsort))));
+
+    Term active_reset =
+        negative_reset
+            ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
+            : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
+    Term inactive_reset = s->make_term(Not, active_reset);
+    rts.add_invar(s->make_term(Implies, in_reset, active_reset));
+    rts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
+
+    prop_term = s->make_term(Implies, reset_done, prop_term);
+  }
+
+  // toggle clock if requested (only supporting toggling every step and starting
+  // at 0 for now)
+  if (!clock_name.empty()) {
+    Term clock_symbol;
+    bool found_clock_symbol = false;
+    for (auto i : rts.inputs()) {
+      if (i->to_string() == clock_name) {
+        clock_symbol = i;
+        found_clock_symbol = true;
+        break;
+      }
+    }
+
+    if (!found_clock_symbol) {
+      logger.log(0, "Could not find clock symbol: {}", clock_name);
+      return 3;
+    }
+
+    Sort one_bit_sort = s->make_sort(BV, 1);
+
+    if (clock_symbol->get_sort() != one_bit_sort) {
+      throw CosaException("Expecting a one-bit clock sort.");
+    }
+
+    Term zero = s->make_term(0, one_bit_sort);
+    rts.constrain_init(s->make_term(Equal, clock_symbol, zero));
+    rts.constrain_trans(s->make_term(
+        Equal, rts.next(clock_symbol), s->make_term(BVNot, clock_symbol)));
+  }
+
+  return prop_term;
+}
 
 int main(int argc, char ** argv)
 {
@@ -181,6 +326,7 @@ int main(int argc, char ** argv)
   unsigned int prop_idx = default_prop_idx;
   unsigned int bound = default_bound;
   unsigned int verbosity = default_verbosity;
+  std::string vcd_name;
   std::string reset_name = default_reset_name;
   unsigned int reset_bnd = default_reset_bnd;
   std::string clock_name = default_clock_name;
@@ -194,6 +340,7 @@ int main(int argc, char ** argv)
       case BOUND: bound = atoi(opt.arg); break;
       case PROP: prop_idx = atoi(opt.arg); break;
       case VERBOSITY: verbosity = atoi(opt.arg); break;
+      case VCDNAME: vcd_name = opt.arg; break;
       case RESET: reset_name = opt.arg; break;
       case RESET_BND: reset_bnd = atoi(opt.arg); break;
       case CLK: clock_name = opt.arg; break;
@@ -208,6 +355,8 @@ int main(int argc, char ** argv)
   logger.set_verbosity(verbosity);
 
   string filename(parse.nonOption(0));
+
+  int status_code = 3;
 
   try {
     SmtSolver s;
@@ -231,167 +380,105 @@ int main(int argc, char ** argv)
       s->set_opt("incremental", "true");
     }
 
-    RelationalTransitionSystem rts(s);
-    BTOR2Encoder btor_enc(filename, rts);
-
-    unsigned int num_bad = btor_enc.badvec().size();
-    if (prop_idx >= num_bad) {
-      cout << "Property index " << prop_idx;
-      cout << " is greater than the number of bad tags in the btor file (";
-      cout << num_bad << ")" << endl;
-      return 3;
-    }
-
-    Term bad = btor_enc.badvec()[prop_idx];
-    Term prop_term = s->make_term(Not, bad);
-
-    // add reset logic if requested
-    if (!reset_name.empty())
-    {
-      bool negative_reset = false;
-
-      if (reset_name.at(0) == '~')
-      {
-        reset_name = reset_name.substr(1, reset_name.length()-1);
-        negative_reset = true;
+    // TODO: make this less ugly, just need to keep it in scope if using
+    //       it would be better to have a generic encoder
+    //       and also only create the transition system once
+    ProverResult r;
+    string file_ext = filename.substr(filename.find_last_of(".") + 1);
+    if (file_ext == "btor2" || file_ext == "btor") {
+      logger.log(2, "Parsing BTOR2 file: {}", filename);
+      FunctionalTransitionSystem fts(s);
+      BTOR2Encoder btor_enc(filename, fts);
+      const TermVec & propvec = btor_enc.propvec();
+      unsigned int num_props = propvec.size();
+      if (prop_idx >= num_props) {
+        throw CosaException(
+            "Property index " + to_string(prop_idx)
+            + " is greater than the number of properties in file " + filename
+            + " (" + to_string(num_props) + ")");
       }
-
-      Term reset_symbol;
-      bool found_reset_symbol = false;
-      for (auto i : rts.inputs())
-      {
-        if (i->to_string() == reset_name)
-        {
-          reset_symbol = i;
-          found_reset_symbol = true;
-          break;
-        }
-      }
-
-      if (!found_reset_symbol)
-      {
-        logger.log(0, "Could not find reset symbol: {}", reset_name);
-        return 3;
-      }
-
-      if (reset_symbol->get_sort()->get_sort_kind() != BV ||
-          reset_symbol->get_sort()->get_width() != 1)
-      {
-        logger.log(0, "Unexpected reset symbol sort: {}", reset_symbol->get_sort());
-        return 3;
-      }
-
-      Sort one_bit_sort = s->make_sort(BV, 1);
-      uint32_t num_bits = ceil(log2(reset_bnd))+1;
-      Sort bvsort = s->make_sort(BV, num_bits);
-      Term reset_bnd_term = s->make_term(reset_bnd, bvsort);
-      Term reset_counter = rts.make_state("__internal_cosa2_reset_cnt__", bvsort);
-
-      Term in_reset = s->make_term(BVUlt, reset_counter, reset_bnd_term);
-      Term reset_done = s->make_term(Not, in_reset);
-
-      rts.constrain_init(s->make_term(Equal, reset_counter, s->make_term(0, bvsort)));
-      rts.set_next(reset_counter, s->make_term(Ite,
-                                               reset_done,
-                                               reset_counter,
-                                               s->make_term(BVAdd, reset_counter, s->make_term(1, bvsort))));
-
-      Term active_reset = negative_reset ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
-        : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
-      Term inactive_reset = s->make_term(Not, active_reset);
-      rts.add_invar(s->make_term(Implies, in_reset, active_reset));
-      rts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
-
-      prop_term = s->make_term(Implies, reset_done, prop_term);
-    }
-
-    // toggle clock if requested (only supporting toggling every step and starting at 0 for now)
-    if (!clock_name.empty())
-    {
-      Term clock_symbol;
-      bool found_clock_symbol = false;
-      for (auto i : rts.inputs())
-      {
-        if (i->to_string() == clock_name)
-        {
-          clock_symbol = i;
-          found_clock_symbol = true;
-          break;
-        }
-      }
-
-      if (!found_clock_symbol)
-      {
-        logger.log(0, "Could not find clock symbol: {}", clock_name);
-        return 3;
-      }
-
-      Sort one_bit_sort = s->make_sort(BV, 1);
-
-      if (clock_symbol->get_sort() != one_bit_sort)
-      {
-        throw CosaException("Expecting a one-bit clock sort.");
-      }
-
-      Term zero = s->make_term(0, one_bit_sort);
-      rts.constrain_init(s->make_term(Equal, clock_symbol, zero));
-      rts.constrain_trans(s->make_term(Equal, rts.next(clock_symbol), s->make_term(BVNot, clock_symbol)));
-    }
-
-    Property p(rts, prop_term);
-    logger.log(1, "Solving property: {}", p.prop());
-
-    std::shared_ptr<Prover> prover;
-    if (engine == BMC) {
-      prover = std::make_shared<Bmc>(p, s);
-    } else if (engine == BMC_SP) {
-      prover = std::make_shared<BmcSimplePath>(p, s);
-    } else if (engine == KIND) {
-      prover = std::make_shared<KInduction>(p, s);
-    } else if (engine == INTERP) {
-      assert(second_solver != NULL);
-      prover = std::make_shared<InterpolantMC>(p, s, second_solver);
-    } else {
-      throw CosaException("Unimplemented engine.");
-    }
-
-    ProverResult r = prover->check_until(bound);
-    if (r == FALSE) {
-      cout << "sat" << endl;
-      cout << "b" << prop_idx << endl;
+      Term prop = propvec[prop_idx];
+      prop = add_reset_and_clock(reset_name, clock_name, prop, fts, s);
+      Property p(fts, prop);
       vector<UnorderedTermMap> cex;
-      if (prover->witness(cex)) {
-        print_witness_btor(btor_enc, cex);
+
+      r = check_prop(engine, bound, p, s, second_solver, cex);
+
+      // print btor output
+      if (r == FALSE) {
+        cout << "sat" << endl;
+        cout << "b" << prop_idx << endl;
+        if (cex.size()) {
+          print_witness_btor(btor_enc, cex);
+          if (!vcd_name.empty()) {
+            VCDWitnessPrinter vcdprinter(fts, cex);
+            vcdprinter.DumpTraceToFile(vcd_name);
+          }
+        }
+        status_code = 1;
+      } else if (r == TRUE) {
+        cout << "unsat" << endl;
+        cout << "b" << prop_idx << endl;
+        status_code = 0;
+      } else {
+        cout << "unknown" << endl;
+        cout << "b" << prop_idx << endl;
+        status_code = 2;
       }
-      return 1;
-    } else if (r == TRUE) {
-      cout << "unsat" << endl;
-      cout << "b" << prop_idx << endl;
-      return 0;
+
+    } else if (file_ext == "smv") {
+      logger.log(2, "Parsing SMV file: {}", filename);
+      RelationalTransitionSystem rts(s);
+      SMVEncoder smv_enc(filename, rts);
+      const TermVec & propvec = smv_enc.propvec();
+      unsigned int num_props = propvec.size();
+      if (prop_idx >= num_props) {
+        throw CosaException(
+            "Property index " + to_string(prop_idx)
+            + " is greater than the number of properties in file " + filename
+            + " (" + to_string(num_props) + ")");
+      }
+      Term prop = propvec[prop_idx];
+      prop = add_reset_and_clock(reset_name, clock_name, prop, fts, s);
+      Property p(rts, prop);
+      std::vector<UnorderedTermMap> cex;
+
+      r = check_prop(engine, bound, p, s, second_solver, cex);
+      logger.log(0, "Property {} is {}", prop_idx, to_string(r));
+
+      if (r == FALSE) {
+        for (size_t t = 0; t < cex.size(); t++) {
+          cout << "AT TIME " << t << endl;
+          for (auto elem : cex[t]) {
+            cout << "\t" << elem.first << " : " << elem.second << endl;
+          }
+        }
+        if (!vcd_name.empty()) {
+          VCDWitnessPrinter vcdprinter(rts, cex);
+          vcdprinter.DumpTraceToFile(vcd_name);
+        }
+      }
     } else {
-      cout << "unknown" << endl;
-      cout << "b" << prop_idx << endl;
-      return 2;
+      throw CosaException("Unrecognized file extension " + file_ext
+                          + " for file " + filename);
     }
   }
   catch (CosaException & ce) {
     cout << ce.what() << endl;
     cout << "unknown" << endl;
     cout << "b" << prop_idx << endl;
-    return 3;
   }
   catch (SmtException & se) {
     cout << se.what() << endl;
     cout << "unknown" << endl;
     cout << "b" << prop_idx << endl;
-    return 3;
   }
-  catch (...) {
+  catch (std::exception & e) {
     cout << "Caught generic exception..." << endl;
+    cout << e.what() << endl;
     cout << "unknown" << endl;
     cout << "b" << prop_idx << endl;
-    return 3;
   }
 
-  return 3;
+  return status_code;
 }
