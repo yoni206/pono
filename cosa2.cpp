@@ -249,8 +249,8 @@ smt::Term add_reset_and_clock(std::string reset_name,
             ? s->make_term(Equal, reset_symbol, s->make_term(0, one_bit_sort))
             : s->make_term(Equal, reset_symbol, s->make_term(1, one_bit_sort));
     Term inactive_reset = s->make_term(Not, active_reset);
-    ts.add_invar(s->make_term(Implies, in_reset, active_reset));
-    ts.add_invar(s->make_term(Implies, reset_done, inactive_reset));
+    ts.constrain_inputs(s->make_term(Implies, in_reset, active_reset));
+    ts.constrain_inputs(s->make_term(Implies, reset_done, inactive_reset));
 
     prop_term = s->make_term(Implies, reset_done, prop_term);
   }
@@ -279,8 +279,10 @@ smt::Term add_reset_and_clock(std::string reset_name,
     }
 
     Term zero = s->make_term(0, one_bit_sort);
-    ts.constrain_init(s->make_term(Equal, clock_symbol, zero));
-    ts.assign_next(clock_symbol, s->make_term(BVNot, clock_symbol));
+    Term clk_state = ts.make_state(clock_name + "__state__", clock_symbol->get_sort());
+    ts.constrain_inputs(s->make_term(Equal, clock_symbol, clk_state));
+    ts.constrain_init(s->make_term(Equal, clk_state, zero));
+    ts.assign_next(clk_state, s->make_term(BVNot, clk_state));
   }
 
   return prop_term;
